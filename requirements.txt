@@ -1,0 +1,6 @@
+torch>=1.9
+numpy
+open_spiel
+pyyaml
+tqdm
+matplotlib
