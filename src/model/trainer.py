@@ -26,7 +26,10 @@ class Trainer:
         take_cards_penalty=0.0,  # Optional penalty for taking cards
         move_penalty=0.0,        # Optional small penalty per move to encourage faster play
         max_moves=None,          # Optional max moves per game
-        forced_terminal_reward=-1.0  # Reward if game is forcibly ended
+        forced_terminal_reward=-1.0,  # Reward if game is forcibly ended
+        use_dirichlet=False,     # Whether to use Dirichlet noise in MCTS
+        dirichlet_alpha=0.3,     # Alpha parameter for Dirichlet distribution
+        dirichlet_epsilon=0.25   # Weight of Dirichlet noise
     ):
         self.network = network
         self.game = game
@@ -42,27 +45,39 @@ class Trainer:
         self.max_moves = max_moves
         self.forced_terminal_reward = forced_terminal_reward
         self.game_count = 0
+        # Dirichlet noise parameters
+        self.use_dirichlet = use_dirichlet
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
         
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
+    
+    def _make_mcts(self):
+        """Create an MCTS instance with current parameters."""
+        return MCTS(
+            self.network, 
+            n_simulations=self.mcts_simulations, 
+            c_puct=self.c_puct, 
+            temperature=self.temperature,
+            use_argmax=self.use_argmax,
+            device=self.device,
+            use_dirichlet=self.use_dirichlet,
+            dirichlet_alpha=self.dirichlet_alpha,
+            dirichlet_epsilon=self.dirichlet_epsilon
+        )
     
     def self_play_game(self):
         """
         Play a game against itself and collect training examples.
         Returns a list of (state, policy, value) tuples.
         """
-        mcts = MCTS(
-            self.network, 
-            n_simulations=self.mcts_simulations, 
-            c_puct=self.c_puct, 
-            temperature=self.temperature,
-            use_argmax=self.use_argmax,
-            device=self.device
-        )
+        mcts = self._make_mcts()
         
         state = self.game.new_initial_state()
         training_examples = []
         move_count = 0
+        game_history = []  # Track game history for LSTM input
         
         # Handle chance node for initial shuffling and dealing
         while state.is_chance_node():
@@ -79,361 +94,493 @@ class Trainer:
             
             current_player = state.current_player()
             
+            # Create history inputs for the network if using history
+            history_actions = None
+            history_actors = None
+            history_lengths = None
+            
+            if hasattr(self.network, 'use_history') and self.network.use_history:
+                # Extract relevant history for current player
+                player_actions = []
+                player_actors = []
+                for actor, action in game_history:
+                    # 1 if action by current player, 0 if by opponent
+                    is_current = 1 if actor == current_player else 0
+                    player_actions.append(action)
+                    player_actors.append(is_current)
+                
+                if player_actions:
+                    history_actions = torch.tensor([player_actions], dtype=torch.long, device=self.device)
+                    history_actors = torch.tensor([player_actors], dtype=torch.long, device=self.device)
+                    history_lengths = torch.tensor([len(player_actions)], dtype=torch.long, device=self.device)
+                else:
+                    # Empty history
+                    history_actions = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                    history_actors = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                    history_lengths = torch.tensor([0], dtype=torch.long, device=self.device)
+            
             # Get policy from MCTS
             action_probs = mcts.run(state)
             
-            # Handle empty policy case
-            if not action_probs:
-                legal_actions = state.legal_actions()
-                if legal_actions:
-                    # If we have legal actions but empty policy, create uniform policy
-                    action_probs = {action: 1.0/len(legal_actions) for action in legal_actions}
-                else:
-                    # No legal actions, must be a terminal state or chance node
-                    continue
-                
-            # Create the observer
+            # Create the observation for the current player
             observer = DurakObserver(
                 pyspiel.IIGObservationType(
-                    perfect_recall=False, public_info=True,
+                    perfect_recall=False, 
+                    public_info=True,
                     private_info=pyspiel.PrivateInfoType.SINGLE_PLAYER),
                 params=None
             )
-            
-            # Set the observation from the current player's perspective
             observer.set_from(state, current_player)
             
-            # Choose an action based on the policy
-            if self.use_argmax:
+            # Store the state tensor, MCTS policy, and history data
+            example = {
+                'state': torch.tensor(observer.tensor, dtype=torch.float32),
+                'policy': np.zeros(self.game.num_distinct_actions()),
+                'value': None,  # Will be updated later
+                'current_player': current_player,
+                'history_actions': player_actions if hasattr(self.network, 'use_history') and self.network.use_history else None,
+                'history_actors': player_actors if hasattr(self.network, 'use_history') and self.network.use_history else None,
+                'history_length': len(player_actions) if hasattr(self.network, 'use_history') and self.network.use_history else 0
+            }
+            
+            # Update the policy in the example
+            for action, prob in action_probs.items():
+                example['policy'][action] = prob
+            
+            training_examples.append(example)
+            
+            # Choose an action based on the MCTS policy
+            if self.temperature == 0:
+                # Greedy choice
                 action = max(action_probs.items(), key=lambda x: x[1])[0]
             else:
-                # Now this won't fail since we ensure action_probs is not empty
+                # Sample according to the probabilities
                 actions, probs = zip(*action_probs.items())
                 action = np.random.choice(actions, p=probs)
             
-            # Store the observation, policy, and current player for later
-            training_examples.append((
-                observer.tensor,
-                action_probs,
-                current_player,
-                None  # Placeholder for the reward
-            ))
+            # Check for take cards penalty
+            if action == ExtraAction.TAKE_CARDS and self.take_cards_penalty > 0:
+                # Apply penalty for taking cards if configured
+                example['take_cards_penalty'] = -self.take_cards_penalty
+            
+            # Add move to history
+            game_history.append((current_player, action))
             
             # Apply the action
             state.apply_action(action)
-            
-            # If chance node after action, resolve it
-            while state.is_chance_node():
-                outcomes = state.chance_outcomes()
-                if outcomes:
-                    action = outcomes[0][0]
-                    state.apply_action(action)
-                else:
-                    break
         
-        # Game has ended, calculate rewards
-        if not state.is_terminal():
-            # Game ended due to move limit
-            # All examples get negative reward for timeout
-            reward = self.forced_terminal_reward
-            returns = [reward, -reward]  # Same as state.returns() would be
-        else:
-            # Game ended normally, get returns
+        # Game over, determine rewards
+        if state.is_terminal():
+            # Use the terminal state rewards for each player
             returns = state.returns()
-        
-        # Update examples with final rewards
-        for i in range(len(training_examples)):
-            obs, probs, player, _ = training_examples[i]
-            
-            # Get reward for this player
-            reward = returns[player]
-            
-            # Apply penalty for taking cards
-            if self.take_cards_penalty > 0:
-                for a, p in probs.items():
-                    if a == ExtraAction.TAKE_CARDS and p > 0:
-                        reward -= self.take_cards_penalty
-            
-            # Apply small penalty per move to encourage faster play
-            if self.move_penalty > 0:
-                reward -= self.move_penalty
-            
-            training_examples[i] = (obs, probs, player, reward)
-        
-        self.game_count += 1
-        
-        # Format training examples for model training
-        formatted_examples = []
-        for obs, probs, player, reward in training_examples:
-            if reward is not None:  # Skip examples without a reward
-                policy_tensor = torch.zeros(self.network.num_actions)
-                for action, prob in probs.items():
-                    policy_tensor[action] = prob
-                
-                formatted_examples.append((
-                    torch.tensor(obs, dtype=torch.float32),
-                    policy_tensor,
-                    reward
-                ))
-        
-        return formatted_examples
-        
-    def play_vs_rule_agent(self, model_player=0):
-        """
-        Play a game against a rule-based agent and collect training examples.
-        The model plays as model_player (0 or 1).
-        """
-        # Create agents and setup state
-        mcts = MCTS(self.network, n_simulations=self.mcts_simulations, 
-                   c_puct=self.c_puct, temperature=self.temperature,
-                   use_argmax=self.use_argmax, device=self.device)
-        
-        rule_agent = RuleAgent()
-        
-        state = self.game.new_initial_state()
-        training_examples = []
-        move_count = 0
-        
-        # Handle initial chance node
-        while state.is_chance_node():
-            outcomes = state.chance_outcomes()
-            if not outcomes:  # Defensive check
-                break
-            action = outcomes[0][0]
-            state.apply_action(action)
-        
-        # Main game loop
-        while not state.is_terminal() and move_count < (self.max_moves or float('inf')):
-            move_count += 1
-            
-            # Check for legal actions - if none, just end this position
-            legal_actions = state.legal_actions()
-            if not legal_actions:
-                print(f"No legal actions at phase {state._phase}. Ending game state.")
-                break
-            
-            current_player = state.current_player()
-            
-            if current_player == model_player:
-                # Model's turn - get policy via MCTS
-                policy = mcts.run(state)
-                
-                # Handle empty policy case
-                if not policy:
-                    policy = {action: 1.0/len(legal_actions) for action in legal_actions}
-                
-                observer = DurakObserver(
-                    pyspiel.IIGObservationType(
-                        perfect_recall=False, public_info=True,
-                        private_info=pyspiel.PrivateInfoType.SINGLE_PLAYER),
-                    params=None
-                )
-                
-                observer.set_from(state, current_player)
-                
-                # Important: Convert to tensor here
-                obs_tensor = torch.tensor(observer.tensor, dtype=torch.float32)
-                
-                # Convert policy to tensor
-                policy_tensor = torch.zeros(self.network.num_actions)
-                for a, p in policy.items():
-                    policy_tensor[a] = p
-                
-                # Choose action
-                if self.use_argmax:
-                    action = max(policy.items(), key=lambda x: x[1])[0]
-                else:
-                    actions, probs = zip(*policy.items())
-                    action = np.random.choice(actions, p=probs)
-                
-                # Store training example with tensor observation and policy
-                training_examples.append((
-                    obs_tensor,              # Tensor observation
-                    policy_tensor,           # Tensor policy
-                    current_player,
-                    0.0  # Placeholder for reward
-                ))
-            else:
-                # Rule agent's turn - ensure we get a valid action
-                try:
-                    action = rule_agent.step(state)
-                    if not isinstance(action, int) or action not in legal_actions:
-                        action = legal_actions[0]  # Fallback
-                except Exception:
-                    action = legal_actions[0]  # Fallback on any error
-            
-            # Apply action
-            state.apply_action(action)
-            
-            # Handle chance nodes
-            while state.is_chance_node():
-                outcomes = state.chance_outcomes()
-                if not outcomes:
-                    break
-                action = outcomes[0][0]
-                state.apply_action(action)
-        
-        # Calculate rewards
-        if not state.is_terminal():
-            reward = self.forced_terminal_reward
+            for i, example in enumerate(training_examples):
+                player = example['current_player']
+                example['value'] = returns[player]
         else:
-            returns = state.returns()
-            reward = returns[model_player]
+            # Game ended due to move limit - apply forced terminal reward
+            for i, example in enumerate(training_examples):
+                player = example['current_player']
+                example['value'] = self.forced_terminal_reward
         
-        # Update examples with final reward
-        for i in range(len(training_examples)):
-            obs_tensor, policy_tensor, player, _ = training_examples[i]
-            value = reward if player == model_player else -reward
-            
-            # Apply penalties
-            if self.move_penalty > 0:
-                value -= self.move_penalty * (i + 1) / len(training_examples)
-            
-            # Store with the final reward
-            training_examples[i] = (obs_tensor, policy_tensor, value)
+        # Apply move penalty if configured (to encourage shorter games)
+        if self.move_penalty > 0:
+            for i, example in enumerate(training_examples):
+                # Small penalty for each move
+                if 'take_cards_penalty' in example:
+                    example['value'] += example['take_cards_penalty']
+                example['value'] -= self.move_penalty
         
         self.game_count += 1
         return training_examples
     
-    def _format_training_examples(self, examples):
-        """Format training examples for model training."""
-        formatted_examples = []
-        for obs, probs, player, reward in examples:
-            if reward is not None:  # Skip examples without a reward
-                policy_tensor = torch.zeros(self.network.num_actions)
-                for action, prob in probs.items():
-                    policy_tensor[action] = prob
-                
-                formatted_examples.append((
-                    torch.tensor(obs, dtype=torch.float32),
-                    policy_tensor,
-                    reward
-                ))
-        
-        return formatted_examples
-    
-    def generate_rule_agent_dataset_for_imitation(self, n_games=500):
-        """Generate a dataset of rule agent moves for imitation learning."""
+    def play_vs_rule_agent(self, model_player=0):
+        """
+        Play a game against a rule agent and collect training examples.
+        model_player: 0 or 1, which player is the model.
+        Returns a list of (state, policy, value) tuples for the model player only.
+        """
         rule_agent = RuleAgent()
-        dataset = []
+        mcts = self._make_mcts()
         
-        for _ in tqdm(range(n_games), desc="Generating rule agent dataset"):
-            state = self.game.new_initial_state()
+        state = self.game.new_initial_state()
+        training_examples = []
+        move_count = 0
+        game_history = []  # Track game history for LSTM input
+        
+        # Handle chance node for initial shuffling and dealing
+        while state.is_chance_node():
+            outcomes = state.chance_outcomes()
+            action = outcomes[0][0]  # Take first action (only one possible)
+            state.apply_action(action)
+        
+        while not state.is_terminal():
+            move_count += 1
             
-            # Handle chance node for initial shuffling and dealing
-            while state.is_chance_node():
-                outcomes = state.chance_outcomes()
-                action = outcomes[0][0]  # Take first action (only one possible)
-                state.apply_action(action)
+            # Check if we've exceeded max moves
+            if self.max_moves and move_count > self.max_moves:
+                break
             
-            while not state.is_terminal():
-                if state.is_chance_node():
-                    outcomes = state.chance_outcomes()
-                    action = outcomes[0][0]  # Take first action (only one possible)
-                    state.apply_action(action)
-                    continue
+            current_player = state.current_player()
+            
+            # Only record training examples for model player
+            if current_player == model_player:
+                # Create history inputs for the network if using history
+                history_actions = None
+                history_actors = None
+                history_lengths = None
                 
-                current_player = state.current_player()
-                legal_actions = state.legal_actions()
-                if not legal_actions:
-                    break
+                if hasattr(self.network, 'use_history') and self.network.use_history:
+                    # Extract relevant history for current player
+                    player_actions = []
+                    player_actors = []
+                    for actor, action in game_history:
+                        # 1 if action by current player, 0 if by opponent
+                        is_current = 1 if actor == current_player else 0
+                        player_actions.append(action)
+                        player_actors.append(is_current)
+                    
+                    if player_actions:
+                        history_actions = torch.tensor([player_actions], dtype=torch.long, device=self.device)
+                        history_actors = torch.tensor([player_actors], dtype=torch.long, device=self.device)
+                        history_lengths = torch.tensor([len(player_actions)], dtype=torch.long, device=self.device)
+                    else:
+                        # Empty history
+                        history_actions = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                        history_actors = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                        history_lengths = torch.tensor([0], dtype=torch.long, device=self.device)
                 
-                # Get the rule agent's action
-                action = rule_agent.step(state)
+                # Get policy from MCTS for model player
+                action_probs = mcts.run(state)
                 
-                # Create one-hot encoded action vector
-                action_one_hot = np.zeros(self.network.num_actions)
-                action_one_hot[action] = 1.0
-                
-                # Record the observation and action
+                # Create the observation for the current player
                 observer = DurakObserver(
                     pyspiel.IIGObservationType(
-                        perfect_recall=False, public_info=True,
+                        perfect_recall=False, 
+                        public_info=True,
                         private_info=pyspiel.PrivateInfoType.SINGLE_PLAYER),
                     params=None
                 )
                 observer.set_from(state, current_player)
                 
-                dataset.append((observer.tensor.copy(), action_one_hot))
+                # Store training example
+                example = {
+                    'state': torch.tensor(observer.tensor, dtype=torch.float32),
+                    'policy': np.zeros(self.network.num_actions),
+                    'value': None,  # Will be updated later
+                    'current_player': current_player,
+                    'history_actions': player_actions if hasattr(self.network, 'use_history') and self.network.use_history else None,
+                    'history_actors': player_actors if hasattr(self.network, 'use_history') and self.network.use_history else None,
+                    'history_length': len(player_actions) if hasattr(self.network, 'use_history') and self.network.use_history else 0
+                }
                 
-                # Apply the action
-                state.apply_action(action)
+                # Update the policy in the example
+                for action, prob in action_probs.items():
+                    example['policy'][action] = prob
+                
+                training_examples.append(example)
+                
+                # Choose an action based on the MCTS policy for model player
+                if self.temperature == 0:
+                    # Greedy choice
+                    action = max(action_probs.items(), key=lambda x: x[1])[0]
+                else:
+                    # Sample according to the probabilities
+                    actions, probs = zip(*action_probs.items())
+                    action = np.random.choice(actions, p=probs)
+                
+                # Check for take cards penalty
+                if action == ExtraAction.TAKE_CARDS and self.take_cards_penalty > 0:
+                    # Apply penalty for taking cards if configured
+                    example['take_cards_penalty'] = -self.take_cards_penalty
+            else:
+                # Rule agent's turn
+                action = rule_agent.step(state)
+            
+            # Add move to history
+            game_history.append((current_player, action))
+            
+            # Apply the action
+            state.apply_action(action)
+        
+        # Game over, determine rewards for model player
+        if state.is_terminal():
+            # Use the terminal state rewards
+            returns = state.returns()
+            for example in training_examples:
+                example['value'] = returns[model_player]
+        else:
+            # Game ended due to move limit - apply forced terminal reward
+            for example in training_examples:
+                example['value'] = self.forced_terminal_reward
+        
+        # Apply move penalty if configured
+        if self.move_penalty > 0:
+            for example in training_examples:
+                if 'take_cards_penalty' in example:
+                    example['value'] += example['take_cards_penalty']
+                example['value'] -= self.move_penalty
+        
+        self.game_count += 1
+        return training_examples
+    
+    def train_step(self, batch):
+        """Perform a single training step on a batch of data."""
+        # Extract states, policies, and values from the batch
+        states_np = np.stack([example["state"] for example in batch])
+        target_policies_np = np.stack([example["policy"] for example in batch])
+        target_values_np = np.array([example["value"] for example in batch])
+        
+        # Check policy dimensions and fix if needed (expand to match model's action space)
+        if target_policies_np.shape[1] != self.network.num_actions:
+            print(f"Warning: Policy dimension mismatch. Got {target_policies_np.shape[1]}, expected {self.network.num_actions}")
+            # Expand policies to match the expected size (add zeros for missing actions)
+            if target_policies_np.shape[1] < self.network.num_actions:
+                padding = np.zeros((target_policies_np.shape[0], 
+                                   self.network.num_actions - target_policies_np.shape[1]))
+                target_policies_np = np.concatenate([target_policies_np, padding], axis=1)
+        
+        # Convert to tensors
+        states = torch.tensor(states_np, dtype=torch.float32).to(self.device)
+        target_policies = torch.tensor(target_policies_np, dtype=torch.float32).to(self.device)
+        target_values = torch.tensor(target_values_np, dtype=torch.float32).to(self.device)
+        
+        # Process with history if network supports it
+        if hasattr(self.network, 'use_history') and self.network.use_history:
+            # Extract history data if available
+            has_history = all(["history_actions" in example for example in batch])
+            
+            if has_history:
+                # Find max history length in batch
+                max_hist_len = 0
+                for example in batch:
+                    hist_len = example.get('history_length', 0) or 0  # Handle None
+                    if hist_len > max_hist_len:
+                        max_hist_len = hist_len
+            
+                # If no history in dataset or all empty histories
+                if max_hist_len == 0:
+                    # Forward pass with dummy history
+                    dummy_hist_actions = torch.zeros((len(batch), 1), dtype=torch.long).to(self.device)
+                    dummy_hist_actors = torch.zeros((len(batch), 1), dtype=torch.long).to(self.device)
+                    dummy_hist_lengths = torch.zeros(len(batch), dtype=torch.long).to(self.device)
+                    
+                    policy_logits, value = self.network(states, dummy_hist_actions, dummy_hist_actors, dummy_hist_lengths)
+                else:
+                    # Prepare history tensors
+                    history_actions = []
+                    history_actors = []
+                    history_lengths = []
+                    
+                    for example in batch:
+                        h_actions = example.get('history_actions', []) or []
+                        h_actors = example.get('history_actors', []) or []
+                        h_length = example.get('history_length', 0) or 0
+                        
+                        # Pad sequences to max_hist_len
+                        padded_actions = h_actions + [0] * (max_hist_len - len(h_actions))
+                        padded_actors = h_actors + [0] * (max_hist_len - len(h_actors))
+                        
+                        history_actions.append(padded_actions)
+                        history_actors.append(padded_actors)
+                        history_lengths.append(h_length)
+                    
+                    # Convert to tensors
+                    history_actions = torch.tensor(history_actions, dtype=torch.long).to(self.device)
+                    history_actors = torch.tensor(history_actors, dtype=torch.long).to(self.device)
+                    history_lengths = torch.tensor(history_lengths, dtype=torch.long).to(self.device)
+                    
+                    # Forward pass with history
+                    policy_logits, value = self.network(states, history_actions, history_actors, history_lengths)
+            else:
+                # Forward pass without history
+                policy_logits, value = self.network(states)
+        else:
+            # Forward pass without history
+            policy_logits, value = self.network(states)
+        
+        # Calculate loss - ensure dimensions match
+        policy_loss = -torch.sum(target_policies * F.log_softmax(policy_logits, dim=1)) / target_policies.size(0)
+        value_loss = F.mse_loss(value, target_values)  # FIXED: Use value output from network
+        total_loss = policy_loss + value_loss
+        
+        # Backward and optimize
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        
+        return total_loss.item(), policy_loss.item(), value_loss.item()
+    
+    def generate_rule_agent_dataset_for_imitation(self, n_games=100):
+        """Generate a dataset from rule agent gameplay for supervised learning."""
+        rule_agent = RuleAgent()
+        dataset = []
+        
+        with tqdm(total=n_games, desc="Generating rule agent dataset") as pbar:
+            for _ in range(n_games):
+                state = self.game.new_initial_state()
+                game_history = []  # Track game history for LSTM input
+                
+                # Handle chance node for initial shuffling and dealing
+                while state.is_chance_node():
+                    outcomes = state.chance_outcomes()
+                    action = outcomes[0][0]  # Take first action (only one possible)
+                    state.apply_action(action)
+                
+                # Play until terminal state is reached
+                while not state.is_terminal():
+                    current_player = state.current_player()
+                    
+                    # Get observation tensor for the current state
+                    observer = DurakObserver(
+                        pyspiel.IIGObservationType(
+                            perfect_recall=False, public_info=True,
+                            private_info=pyspiel.PrivateInfoType.SINGLE_PLAYER
+                        ),
+                        params=None
+                    )
+                    observer.set_from(state, current_player)
+                    obs_tensor = observer.tensor
+                    
+                    # Get rule agent's action
+                    action = rule_agent.step(state)
+                    
+                    # Create target policy (one-hot for the rule agent's action)
+                    legal_actions = state.legal_actions()
+                    target_policy = np.zeros(self.network.num_actions)
+                    if action in legal_actions:
+                        target_policy[action] = 1.0
+                    else:
+                        # If invalid action, create uniform policy over legal actions
+                        for a in legal_actions:
+                            target_policy[a] = 1.0 / len(legal_actions)
+                    
+                    # Create history inputs for the network if using history
+                    history_actions = []
+                    history_actors = []
+                    history_length = 0
+                    
+                    if hasattr(self.network, 'use_history') and self.network.use_history:
+                        # Extract relevant history for current player
+                        for actor, act in game_history:
+                            # 1 if action by current player, 0 if by opponent
+                            is_current = 1 if actor == current_player else 0
+                            history_actions.append(act)
+                            history_actors.append(is_current)
+                        
+                        history_length = len(history_actions)
+                    
+                    # Add to dataset
+                    example = {
+                        'state': obs_tensor,
+                        'target_policy': target_policy,
+                        'history_actions': history_actions,
+                        'history_actors': history_actors,
+                        'history_length': history_length
+                    }
+                    dataset.append(example)
+                    
+                    # Apply action and update history
+                    state.apply_action(action)
+                    game_history.append((current_player, action))
+                
+                pbar.update(1)
         
         return dataset
     
-    def train_supervised_on_rule_agent_dataset(self, dataset, batch_size=32, epochs=10):
-        """Train the model on rule agent data using supervised learning."""
-        self.network.train()
+    def train_supervised_on_rule_agent_dataset(self, dataset, batch_size=64, epochs=3):
+        """Train the network using supervised learning on a dataset from the rule agent."""
+        # Shuffle dataset
+        indices = list(range(len(dataset)))
+        random.shuffle(indices)
         
-        # Convert dataset to tensors
-        observations = [torch.tensor(obs, dtype=torch.float32, device=self.device) for obs, _ in dataset]
-        actions = [torch.tensor(act, dtype=torch.float32, device=self.device) for _, act in dataset]
+        # Check if network uses history
+        uses_history = hasattr(self.network, 'use_history') and self.network.use_history
         
-        dataset_size = len(observations)
-        indices = list(range(dataset_size))
+        total_loss = 0
+        batches = 0
         
         for epoch in range(epochs):
+            # Shuffle again for each epoch
             random.shuffle(indices)
-            total_loss = 0.0
-            num_batches = (dataset_size + batch_size - 1) // batch_size
             
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, dataset_size)
+            for start_idx in range(0, len(dataset), batch_size):
+                end_idx = min(start_idx + batch_size, len(dataset))
                 batch_indices = indices[start_idx:end_idx]
                 
-                batch_obs = torch.stack([observations[i] for i in batch_indices])
-                batch_actions = torch.stack([actions[i] for i in batch_indices])
+                # Get batch data
+                batch = [dataset[i] for i in batch_indices]
+                actual_batch_size = len(batch)
                 
+                # Prepare input tensors - use numpy.stack for better performance
+                states_np = np.stack([example['state'] for example in batch])
+                states = torch.tensor(states_np, dtype=torch.float32).to(self.device)
+                
+                target_policies_np = np.stack([example['target_policy'] for example in batch])
+                target_policies = torch.tensor(target_policies_np, dtype=torch.float32).to(self.device)
+                
+                # Process with history if network supports it
+                if uses_history:
+                    # Find max history length in batch
+                    max_hist_len = 0
+                    for example in batch:
+                        hist_len = example.get('history_length', 0) or 0  # Handle None
+                        if hist_len > max_hist_len:
+                            max_hist_len = hist_len
+                    
+                    # If no history in dataset or all empty histories
+                    if max_hist_len == 0:
+                        # Forward pass with dummy history
+                        dummy_hist_actions = torch.zeros((actual_batch_size, 1), dtype=torch.long).to(self.device)
+                        dummy_hist_actors = torch.zeros((actual_batch_size, 1), dtype=torch.long).to(self.device)
+                        dummy_hist_lengths = torch.zeros(actual_batch_size, dtype=torch.long).to(self.device)
+                        
+                        policy_logits, _ = self.network(states, dummy_hist_actions, dummy_hist_actors, dummy_hist_lengths)
+                    else:
+                        # Prepare history tensors
+                        history_actions = []
+                        history_actors = []
+                        history_lengths = []
+                        
+                        for example in batch:
+                            h_actions = example.get('history_actions', []) or []
+                            h_actors = example.get('history_actors', []) or []
+                            h_length = example.get('history_length', 0) or 0
+                            
+                            # Pad sequences to max_hist_len
+                            padded_actions = h_actions + [0] * (max_hist_len - len(h_actions))
+                            padded_actors = h_actors + [0] * (max_hist_len - len(h_actors))
+                            
+                            history_actions.append(padded_actions)
+                            history_actors.append(padded_actors)
+                            history_lengths.append(h_length)
+                        
+                        # Convert to tensors
+                        history_actions = torch.tensor(history_actions, dtype=torch.long).to(self.device)
+                        history_actors = torch.tensor(history_actors, dtype=torch.long).to(self.device)
+                        history_lengths = torch.tensor(history_lengths, dtype=torch.long).to(self.device)
+                        
+                        # Forward pass with history
+                        policy_logits, _ = self.network(states, history_actions, history_actors, history_lengths)
+                else:
+                    # Forward pass without history
+                    policy_logits, _ = self.network(states)
+                
+                # Calculate cross-entropy loss
+                policy_loss = -torch.sum(target_policies * F.log_softmax(policy_logits, dim=1)) / target_policies.size(0)
+                
+                # Backward and optimize
                 self.optimizer.zero_grad()
-                policy_logits, _ = self.network(batch_obs)
-                
-                # Use cross-entropy loss for policy
-                loss = F.cross_entropy(policy_logits, torch.argmax(batch_actions, dim=1))
-                
-                loss.backward()
+                policy_loss.backward()
                 self.optimizer.step()
                 
-                total_loss += loss.item()
+                total_loss += policy_loss.item()
+                batches += 1
             
-            print(f"Epoch {epoch+1}/{epochs}, Supervised Loss: {total_loss/num_batches:.4f}")
+            avg_loss = total_loss / batches if batches > 0 else 0
+            print(f"Epoch {epoch+1}/{epochs}, Supervised Loss: {avg_loss:.4f}")
     
-    def train_step(self, batch):
-        """Perform a single training step on a batch of examples."""
-        self.optimizer.zero_grad()
-        
-        # Extract batch components
-        observations = [item[0] for item in batch]
-        policies = [item[1] for item in batch]
-        rewards = [item[2] for item in batch]
-        
-        # Ensure all are tensors (this is the critical fix)
-        observations = [torch.tensor(obs, dtype=torch.float32) if not isinstance(obs, torch.Tensor) else obs for obs in observations]
-        policies = [torch.tensor(pol, dtype=torch.float32) if not isinstance(pol, torch.Tensor) else pol for pol in policies]
-        
-        # Now stack and move to device
-        observations = torch.stack(observations).to(self.device)
-        policies = torch.stack(policies).to(self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        
-        # Forward pass
-        policy_logits, values = self.network(observations)
-        
-        # Calculate losses
-        policy_loss = F.cross_entropy(policy_logits, policies)
-        value_loss = F.mse_loss(values, rewards)
-        
-        # Combined loss
-        loss = policy_loss + value_loss
-        
-        # Backward pass and optimize
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss.item(), policy_loss.item(), value_loss.item()
-    
-    def save_checkpoint(self, iteration):
-        """Save a checkpoint of the model."""
+    def save_checkpoint(self, iteration=0):
+        """Save a checkpoint."""
         checkpoint_path = os.path.join(self.checkpoint_dir, f"{iteration}.ckpt")
         torch.save({
             'model_state_dict': self.network.state_dict(),

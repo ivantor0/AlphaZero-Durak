@@ -57,13 +57,18 @@ class Node:
         return len(self.children) == 0
 
 class MCTS:
-    def __init__(self, network, n_simulations=800, c_puct=1.0, temperature=1.0, use_argmax=False, device="cpu"):
+    def __init__(self, network, n_simulations=800, c_puct=1.0, temperature=1.0, use_argmax=False, device="cpu", 
+                 dirichlet_alpha=0.3, dirichlet_epsilon=0.25, use_dirichlet=False):
         self.network = network
         self.n_simulations = n_simulations
         self.c_puct = c_puct
         self.temperature = temperature
         self.use_argmax = use_argmax
         self.device = device
+        # Dirichlet noise parameters for exploration
+        self.use_dirichlet = use_dirichlet
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
     
     def run(self, root_state):
         root = Node(root_state, 1.0)
@@ -74,7 +79,36 @@ class MCTS:
         if not legal_actions:
             return {}  # No legal actions, return empty policy
             
-        action_probs = [(action, 1.0 / len(legal_actions)) for action in legal_actions]
+        # Get initial policy from the network
+        observer = DurakObserver(
+            pyspiel.IIGObservationType(
+                perfect_recall=False, public_info=True,
+                private_info=pyspiel.PrivateInfoType.SINGLE_PLAYER),
+            params=None
+        )
+        observer.set_from(root_state, root_player)
+        
+        with torch.no_grad():
+            obs_tensor = torch.tensor(observer.tensor, dtype=torch.float32, device=self.device).unsqueeze(0)
+            policy_logits, _ = self.network(obs_tensor)
+            # Convert policy logits to probabilities
+            policy = F.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
+        
+        # Only consider legal actions and normalize
+        policy_legal = [(action, policy[action]) for action in legal_actions]
+        policy_sum = sum(p for _, p in policy_legal)
+        if policy_sum > 0:
+            action_probs = [(a, p / policy_sum) for a, p in policy_legal]
+        else:
+            # Handle zero sum case with equal probabilities
+            action_probs = [(a, 1.0 / len(legal_actions)) for a in legal_actions]
+        
+        # Add Dirichlet noise to root node for exploration (if enabled)
+        if self.use_dirichlet:
+            noise = np.random.dirichlet([self.dirichlet_alpha] * len(legal_actions))
+            action_probs = [(a, (1 - self.dirichlet_epsilon) * p + self.dirichlet_epsilon * noise[i]) 
+                           for i, (a, p) in enumerate(action_probs)]
+        
         root.expand(action_probs)
         
         # Run simulations
