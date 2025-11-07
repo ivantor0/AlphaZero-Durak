@@ -1,0 +1,16 @@
+seed: 2025
+device: "cuda"
+lr: 0.0001
+batch_size: 1024
+replay_size: 500000
+grad_clip: 1.0
+eps_start: 0.30
+eps_end: 0.05
+eps_decay_games: 200000
+truesight_games: 10000
+games_per_iter: 500
+train_steps_per_iter: 1000
+eval_interval_iters: 5
+eval_games: 200
+checkpoint_interval_iters: 5
+hidden_scale: 1.0
