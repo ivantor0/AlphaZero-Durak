@@ -30,6 +30,8 @@ class DurakState:
     terminal: bool = False
     winner: Optional[int] = None
     last_round_winner: Optional[int] = None
+    defender_taking: bool = False
+    post_take_additions_remaining: int = 0
 
     def copy(self) -> "DurakState":
         return DurakState(
@@ -47,6 +49,8 @@ class DurakState:
             terminal=self.terminal,
             winner=self.winner,
             last_round_winner=self.last_round_winner,
+            defender_taking=self.defender_taking,
+            post_take_additions_remaining=self.post_take_additions_remaining,
         )
 
 
@@ -124,7 +128,18 @@ def legal_actions(state: DurakState) -> np.ndarray:
         return mask
     if state.phase == "attack":
         attacker_hand = state.hands[state.attacker]
-        if state.table:
+        if state.defender_taking:
+            playable: List[int] = []
+            if (
+                state.post_take_additions_remaining > 0
+                and len(state.table) < MAX_ATTACK_CARDS
+            ):
+                ranks_on_table = _ranks_on_table(state.table)
+                playable = [card for card in attacker_hand if card_rank(card) in ranks_on_table]
+            for card in playable:
+                mask[card] = True
+            mask[ACTION_END_ATTACK] = True
+        elif state.table:
             if _all_cards_covered(state.table):
                 if len(state.table) < state.round_attack_limit and attacker_hand:
                     ranks_on_table = _ranks_on_table(state.table)
@@ -165,7 +180,9 @@ def apply_action(state: DurakState, action: int) -> Tuple[DurakState, bool, Opti
         return state, True, state.winner
     if state.phase == "attack":
         if action == ACTION_END_ATTACK:
-            if state.table and _all_cards_covered(state.table):
+            if state.defender_taking:
+                _finalize_take(state)
+            elif state.table and _all_cards_covered(state.table):
                 _finish_round_with_defense(state)
             else:
                 raise ValueError("Cannot end attack before defender covers all cards.")
@@ -184,16 +201,34 @@ def _play_attack_card(state: DurakState, card: int) -> None:
     if card not in state.hands[state.attacker]:
         raise ValueError("Attacker does not hold this card.")
     if state.table:
-        if not _all_cards_covered(state.table):
-            raise ValueError("Cannot add new attack card until defender covers current cards.")
-        if len(state.table) >= state.round_attack_limit:
-            raise ValueError("Attack limit reached for this round.")
-        ranks = _ranks_on_table(state.table)
-        if card_rank(card) not in ranks:
-            raise ValueError("Attack card must match rank already on table.")
+        if state.defender_taking:
+            if len(state.table) >= MAX_ATTACK_CARDS:
+                raise ValueError("Attack limit reached for this round.")
+            if state.post_take_additions_remaining <= 0:
+                raise ValueError("No additional cards allowed after defender takes.")
+            ranks = _ranks_on_table(state.table)
+            if card_rank(card) not in ranks:
+                raise ValueError("Attack card must match rank already on table.")
+        else:
+            if not _all_cards_covered(state.table):
+                raise ValueError("Cannot add new attack card until defender covers current cards.")
+            if len(state.table) >= state.round_attack_limit:
+                raise ValueError("Attack limit reached for this round.")
+            ranks = _ranks_on_table(state.table)
+            if card_rank(card) not in ranks:
+                raise ValueError("Attack card must match rank already on table.")
     state.hands[state.attacker].remove(card)
     state.table.append((card, None))
     state.seen_cards.add(card)
+    if state.defender_taking:
+        state.post_take_additions_remaining = max(0, state.post_take_additions_remaining - 1)
+        if (
+            state.post_take_additions_remaining == 0
+            or len(state.table) >= MAX_ATTACK_CARDS
+            or not _attacker_has_matching_rank(state)
+        ):
+            _finalize_take(state)
+        return
     state.phase = "defense"
 
 
@@ -229,15 +264,19 @@ def _defend_card(state: DurakState, card: int) -> None:
 
 
 def _defender_takes(state: DurakState) -> None:
-    for attack_card, defense_card in state.table:
-        state.hands[state.defender].append(attack_card)
-        if defense_card is not None:
-            state.hands[state.defender].append(defense_card)
-    state.hands[state.defender].sort()
-    state.table.clear()
-    _refill_hands(state, state.attacker, state.defender)
+    if state.defender_taking:
+        return
+    state.defender_taking = True
+    state.post_take_additions_remaining = min(
+        MAX_ATTACK_CARDS, len(state.hands[state.defender])
+    )
     state.phase = "attack"
-    state.round_attack_limit = _compute_attack_limit(state.hands[state.defender])
+    if (
+        state.post_take_additions_remaining == 0
+        or len(state.table) >= MAX_ATTACK_CARDS
+        or not _attacker_has_matching_rank(state)
+    ):
+        _finalize_take(state)
     state.last_round_winner = None
 
 
@@ -259,6 +298,23 @@ def _finish_round_with_defense(state: DurakState) -> None:
     state.hands[state.attacker].sort()
     state.hands[state.defender].sort()
     state.last_round_winner = state.attacker
+    state.defender_taking = False
+    state.post_take_additions_remaining = 0
+
+
+def _finalize_take(state: DurakState) -> None:
+    for attack_card, defense_card in state.table:
+        state.hands[state.defender].append(attack_card)
+        if defense_card is not None:
+            state.hands[state.defender].append(defense_card)
+    state.hands[state.defender].sort()
+    state.table.clear()
+    _refill_hands(state, state.attacker, state.defender)
+    state.phase = "attack"
+    state.round_attack_limit = _compute_attack_limit(state.hands[state.defender])
+    state.defender_taking = False
+    state.post_take_additions_remaining = 0
+    state.last_round_winner = None
 
 
 def _refill_hands(state: DurakState, first: int, second: int) -> None:
