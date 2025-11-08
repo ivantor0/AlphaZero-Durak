@@ -267,8 +267,9 @@ def _defender_takes(state: DurakState) -> None:
     if state.defender_taking:
         return
     state.defender_taking = True
+    remaining_slots = max(0, MAX_ATTACK_CARDS - len(state.table))
     state.post_take_additions_remaining = min(
-        MAX_ATTACK_CARDS, len(state.hands[state.defender])
+        remaining_slots, len(state.hands[state.defender])
     )
     state.phase = "attack"
     if (
